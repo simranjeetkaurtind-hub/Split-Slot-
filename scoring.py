@@ -87,6 +87,7 @@ def saturation_threshold_for_jo(jo: dict) -> float:
     - ELTP (any priority) → 0.50
     - LATERAL P0 / P1 → 0.75
     - LATERAL P2 / P3 → 0.50 (P2 saturates faster than P0/P1)
+
     """
     assert_jo_dict(jo)
     if str(jo.get("type", "")).strip().upper() == JOType.ELTP.value:
@@ -103,6 +104,44 @@ def saturation_ratio(jo: dict) -> float:
     if init <= 0:
         return 1.0
     return safe_int(jo.get("slots_allocated"), 0) / init
+
+
+def get_saturation_band(jo: dict) -> tuple[str, str, str, float]:
+    """
+    Returns (band_name, band_label, split_rule, dominant_share).
+    Band labels:
+    - P0/P1: BELOW LOW (<45%), LOW (≥45%), MID (≥65%), HIGH (≥80%)
+    - P2/P3/ELTP: BELOW LOW (<25%), LOW (≥25%), HIGH (≥50%)
+    """
+    assert_jo_dict(jo)
+    ratio = saturation_ratio(jo)
+    pl = priority_level(jo["priority"])
+    if pl in (0, 1):
+        if ratio < 0.45:
+            return ("BELOW LOW", "BELOW LOW", "GREEDY (100%)", 1.0)
+        if ratio < 0.65:
+            return ("LOW", "LOW (≥ 45%)", "80:20", 0.80)
+        if ratio < 0.80:
+            return ("MID", "MID (≥ 65%)", "60:40", 0.60)
+        return ("HIGH", "HIGH (≥ 80%)", "30:70", 0.30)
+    if ratio < 0.25:
+        return ("BELOW LOW", "BELOW LOW", "GREEDY (100%)", 1.0)
+    if ratio < 0.50:
+        return ("LOW", "LOW (≥ 25%)", "80:20", 0.80)
+    return ("HIGH", "HIGH (≥ 50%)", "50:50", 0.50)
+
+
+def get_split_ratio(jo: dict) -> tuple[float, float]:
+    """
+    Progressive saturation band: (dominant_share, competing_share) from priority + saturation_ratio(jo).
+    ELTP follows the P2/P3 bands. Shares sum to 1.0. Used for batch cap splits.
+    """
+    _, _, _, dominant_share = get_saturation_band(jo)
+    return (dominant_share, 1.0 - dominant_share)
+
+
+# Backward-compatible name
+saturation_band_split = get_split_ratio
 
 
 def saturation_pct(jo: dict) -> float:

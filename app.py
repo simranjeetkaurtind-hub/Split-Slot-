@@ -343,8 +343,6 @@ with tab_batch:
                 expanded=bd.batch_index == 0,
             ):
                 st.code("\n".join(bd.debug_log_lines), language=None)
-                st.markdown("**Saturation threshold % (rule)**")
-                st.json({k: round(v, 2) for k, v in bd.saturation_threshold_pct.items()})
                 st.markdown("**Allocation this batch — lateral**")
                 st.json(bd.lateral_assigned_this_batch or {})
                 st.markdown("**Allocation this batch — ELTP**")

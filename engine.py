@@ -1,16 +1,13 @@
 """
-Slot-driven allocation (base score, priority via scoring, saturation share caps, fairness pools).
+Slot-driven allocation (base score + delta + saturation-band caps).
 
-- Rank laterals by **base score** (desc); priority is already in the score — no separate tier sort.
-  Delta = |JO-1 − JO-2| for the top pair; next tier uses the top two among **remaining** JOs by score.
-- Phase: equal tier → 50–50 full batch; dominant → Greedy until saturation policy; after saturation
-  → top pool = ceil(60% of N) and next pool = remainder (Case A: equal+both saturated ~50–50 in top;
-  Case B: top pool shared between JO-1 & JO-2; next tier (40%) to top two among ranked[2:] using delta rules.
-- Each slot is routed to **top pool** (only JO-1 & JO-2) or **next pool** (those two remainder leaders per caps), then
-  argmax(final_score) among eligible — not first-fit order.
-- Lifetime share cap (75% / 50%) throttles Greedy/50–50; in **60–40** phase it is not applied in
-  `_lateral_valid_for_slot` (batch caps express the split; avoids double-blocking top pool).
-- ELTP only when no lateral can take a slot.
+- Rank candidates by **base score** (desc); priority is already in the score.
+- Layered allocation per batch:
+  - Delta chooses competitors at each layer (JO-1 vs JO-2).
+  - Saturation bands (`get_split_ratio`) decide top-pool size for that layer.
+  - Delta decides split within the pool (equal → 50–50; else greedy).
+  - Remaining slots repeat the same logic on the remaining JOs.
+- Assignment is argmax(final_score) within the layer’s candidate set and caps.
 """
 
 from __future__ import annotations
@@ -30,9 +27,10 @@ from models import (
 from scoring import (
     base_score,
     final_score,
+    get_saturation_band,
     is_saturated,
+    get_split_ratio,
     saturation_pct,
-    saturation_threshold_for_jo,
     score_breakdown,
     saturation_ratio,
 )
@@ -42,9 +40,8 @@ BATCH_SIZE = 4
 
 
 class Phase:
+    LAYERED = "Layered"
     GREEDY = "Greedy"
-    SPLIT_60_40 = "60–40"
-    SPLIT_50_50 = "50–50"
 
 
 def _match_tech_level(jo: dict, slot: Slot) -> bool:
@@ -71,15 +68,22 @@ def _lateral_eligible_for_batch(jos: dict[str, dict], batch_slots: list[Slot]) -
     out: list[dict] = []
     for jo in jos.values():
         assert_jo_dict(jo)
-        if str(jo["type"]).strip().upper() != JOType.LATERAL.value or safe_int(jo.get("active_demand"), 0) <= 0:
+        jo_type = str(jo.get("type", "")).strip().upper()
+        if jo_type not in (JOType.LATERAL.value, JOType.ELTP.value):
+            continue
+        if safe_int(jo.get("active_demand"), 0) <= 0:
             continue
         if any(_match_tech_level(jo, s) for s in batch_slots):
             out.append(jo)
     return out
 
 
-def _top_next_pool_sizes(batch_n: int) -> tuple[int, int]:
-    top_pool = int(math.ceil(batch_n * 0.6))
+def _top_next_pool_sizes(batch_n: int, dominant_share: float = 0.6) -> tuple[int, int]:
+    """
+    dominant_share: fraction of batch going to dominant+competing top pool.
+    Defaults to 0.6 when no band overrides.
+    """
+    top_pool = int(math.floor(batch_n * dominant_share))
     return top_pool, batch_n - top_pool
 
 
@@ -129,14 +133,13 @@ def _apply_next_tier_caps(caps: dict[str, int], ranked: list[dict], next_pool: i
     caps[idb] = caps.get(idb, 0) + cb
 
 
-def _caps_case_a_equal_both_saturated(ranked: list[dict], batch_n: int) -> dict[str, int]:
+def _caps_case_a_equal_both_saturated(
+    ranked: list[dict], batch_n: int, dominant_share: float = 0.6
+) -> dict[str, int]:
     """
-    Case A: delta ≤ 0.04, both saturated — top pool shared ~50–50; next pool to next tier (or JO-2 if only two JOs).
-
-    IMPORTANT: These batch caps are the throttle. Top-pool slots must be filled only by JO-1 and JO-2
-    (see _pick_best_lateral_for_slot); saturation ratio must not zero out their eligibility separately.
+    Legacy helper (pre-layered). Retained for reference; layered mode no longer uses this path.
     """
-    top_pool, next_pool = _top_next_pool_sizes(batch_n)
+    top_pool, next_pool = _top_next_pool_sizes(batch_n, dominant_share=dominant_share)
     id0 = str(ranked[0]["id"])
     id1 = str(ranked[1]["id"])
     c0 = int(math.ceil(top_pool / 2))
@@ -148,15 +151,13 @@ def _caps_case_a_equal_both_saturated(ranked: list[dict], batch_n: int) -> dict[
     return caps
 
 
-def _caps_case_b_dominant_saturated(ranked: list[dict], batch_n: int) -> dict[str, int]:
+def _caps_case_b_dominant_saturated(
+    ranked: list[dict], batch_n: int, dominant_share: float = 0.6
+) -> dict[str, int]:
     """
-    Case B: 60–40 phase — top pool shared between JO-1 and JO-2; 40% tier to top two among ranked[2:] (delta).
-
-    When len(ranked) > 2, never give ranked[1] batch cap 0 while top-pool routing uses [JO-1, JO-2] —
-    that starves the second-highest **score** lateral while lower ranks still receive next-tier caps.
-    Split the top pool ~50–50 between the top pair (same split as Case A's top portion).
+    Legacy helper (pre-layered). Retained for reference; layered mode no longer uses this path.
     """
-    top_pool, next_pool = _top_next_pool_sizes(batch_n)
+    top_pool, next_pool = _top_next_pool_sizes(batch_n, dominant_share=dominant_share)
     id0 = str(ranked[0]["id"])
     id1 = str(ranked[1]["id"])
     if len(ranked) == 2:
@@ -166,6 +167,100 @@ def _caps_case_b_dominant_saturated(ranked: list[dict], batch_n: int) -> dict[st
     caps: dict[str, int] = {id0: c0, id1: c1}
     _apply_next_tier_caps(caps, ranked, next_pool)
     return caps
+
+
+def _build_layer_specs(ranked: list[dict], batch_n: int) -> tuple[list[dict], dict[str, int]]:
+    """
+    Build layered cap specs for a batch:
+    - layer candidates come from the top-ranked remaining JOs
+    - delta decides whether JO-2 competes in the layer
+    - saturation (get_split_ratio) decides top_pool_slots size
+    """
+    layers: list[dict] = []
+    remaining_slots = batch_n
+    remaining = list(ranked)
+    caps_total: dict[str, int] = {str(j["id"]): 0 for j in ranked}
+
+    while remaining_slots > 0 and remaining:
+        if len(remaining) == 1:
+            jo = remaining[0]
+            jid = str(jo["id"])
+            layer_caps = {jid: remaining_slots}
+            layers.append(
+                {
+                    "slot_count": remaining_slots,
+                    "candidate_ids": [jid],
+                    "caps": layer_caps,
+                    "delta": None,
+                }
+            )
+            caps_total[jid] = caps_total.get(jid, 0) + remaining_slots
+            break
+
+        top1, top2 = remaining[0], remaining[1]
+        assert_jo_dict(top1)
+        assert_jo_dict(top2)
+        id0 = str(top1["id"])
+        id1 = str(top2["id"])
+        _, _, split_rule, dom_share = get_saturation_band(top1)
+        delta = abs(base_score(top1) - base_score(top2))
+        if dom_share == 1.0:
+            if delta <= DELTA_EQUAL:
+                c0 = int(math.ceil(remaining_slots / 2))
+                c1 = remaining_slots - c0
+                layer_caps = {id0: c0, id1: c1}
+                candidate_ids = [id0, id1]
+                split_rule = "50:50 (delta in greedy band)"
+            else:
+                layer_caps = {id0: remaining_slots}
+                candidate_ids = [id0]
+            layers.append(
+                {
+                    "slot_count": remaining_slots,
+                    "candidate_ids": candidate_ids,
+                    "caps": layer_caps,
+                    "delta": delta,
+                    "split_rule": split_rule,
+                }
+            )
+            for jid, count in layer_caps.items():
+                caps_total[jid] = caps_total.get(jid, 0) + count
+            remaining_slots = 0
+            break
+        top_pool_slots = int(math.floor(remaining_slots * dom_share))
+        top_pool_slots = max(0, min(top_pool_slots, remaining_slots))
+
+        if top_pool_slots == 0:
+            remove_ids = {id0} if delta > DELTA_EQUAL else {id0, id1}
+            remaining = [j for j in remaining if str(j["id"]) not in remove_ids]
+            continue
+        if delta <= DELTA_EQUAL:
+            c0 = int(math.ceil(top_pool_slots / 2))
+            c1 = top_pool_slots - c0
+            layer_caps = {id0: c0, id1: c1}
+            candidate_ids = [id0, id1]
+            remove_ids = {id0, id1}
+        else:
+            layer_caps = {id0: top_pool_slots}
+            candidate_ids = [id0]
+            remove_ids = {id0}
+
+        layers.append(
+            {
+                "slot_count": top_pool_slots,
+                "candidate_ids": candidate_ids,
+                "caps": layer_caps,
+                "delta": delta,
+                "split_rule": split_rule,
+            }
+        )
+        for jid, count in layer_caps.items():
+            caps_total[jid] = caps_total.get(jid, 0) + count
+
+        remaining_slots -= top_pool_slots
+        remaining = [j for j in remaining if str(j["id"]) not in remove_ids]
+
+    return layers, caps_total
 
 
 def _compute_phase_and_caps(
@@ -183,36 +278,39 @@ def _compute_phase_and_caps(
     bool,
     int | None,
     int | None,
+    list[dict],
 ]:
     """
-    Lateral JOs only. Base score only for delta (no affinity).
-
-    Order matters: both tops saturated → Case A/B; JO-1 saturated and JO-2 not → Case B (not 50–50);
-    then delta ≤ 0.04 → 50–50 (only reached when JO-1 is not saturated); then Greedy; no stray 50–50
-    when JO-1 is saturated.
+    Lateral/ELTP JOs. Base score only for delta (no affinity). Layering is driven by `get_split_ratio`
+    (dominant saturation) and delta at each layer.
 
     Returns (phase, caps, delta, dominant_id, next_id, top_bs, second_bs,
-             top1_sat, top2_sat, top_pool, next_pool).
+             top1_sat, top2_sat, top_pool, next_pool, layer_specs).
     """
     if not ranked:
-        return ("-", {}, None, None, None, None, None, False, False, None, None)
+        return ("-", {}, None, None, None, None, None, False, False, None, None, [])
     top1 = ranked[0]
     assert_jo_dict(top1)
     dominant_id = str(top1["id"])
     b0 = base_score(top1)
+    top1_sat = is_saturated(top1)
     if len(ranked) == 1:
+        layers, caps = _build_layer_specs(ranked, batch_n)
+        top_pool_dbg = layers[0]["slot_count"] if layers else None
+        next_pool_dbg = batch_n - top_pool_dbg if top_pool_dbg is not None else None
         return (
-            Phase.GREEDY,
-            {dominant_id: batch_n},
+            Phase.LAYERED,
+            caps,
             None,
             dominant_id,
             None,
             b0,
             None,
-            is_saturated(top1),
+            top1_sat,
             False,
-            None,
-            None,
+            top_pool_dbg,
+            next_pool_dbg,
+            layers,
         )
 
     top2 = ranked[1]
@@ -220,54 +318,14 @@ def _compute_phase_and_caps(
     next_id = str(top2["id"])
     b1 = base_score(top2)
     delta = abs(b0 - b1)
-    top1_sat = is_saturated(top1)
     top2_sat = is_saturated(top2)
 
-    top_pool_dbg: int | None = None
-    next_pool_dbg: int | None = None
-
-    if top1_sat and top2_sat:
-        phase = Phase.SPLIT_60_40
-        if delta <= DELTA_EQUAL:
-            caps = _caps_case_a_equal_both_saturated(ranked, batch_n)
-        else:
-            caps = _caps_case_b_dominant_saturated(ranked, batch_n)
-        top_pool_dbg, next_pool_dbg = _top_next_pool_sizes(batch_n)
-    elif top1_sat and not top2_sat:
-        # JO-1 saturated, JO-2 not — Case B regardless of delta (cannot stay on 50–50 when JO-1 is saturated).
-        phase = Phase.SPLIT_60_40
-        caps = _caps_case_b_dominant_saturated(ranked, batch_n)
-        top_pool_dbg, next_pool_dbg = _top_next_pool_sizes(batch_n)
-    elif delta <= DELTA_EQUAL:
-        phase = Phase.SPLIT_50_50
-        equal_group = [j for j in ranked if abs(base_score(j) - b0) <= DELTA_EQUAL]
-        n_equal = len(equal_group)
-        base_share = batch_n // n_equal
-        remainder = batch_n % n_equal
-        caps = {}
-        for i, j in enumerate(equal_group):
-            assert_jo_dict(j)
-            caps[str(j["id"])] = base_share + (1 if i < remainder else 0)
-        for j in ranked:
-            assert_jo_dict(j)
-            caps.setdefault(str(j["id"]), 0)
-        next_id = str(equal_group[1]["id"]) if len(equal_group) > 1 else None
-        b1 = base_score(equal_group[1]) if len(equal_group) > 1 else None
-    elif not top1_sat:
-        phase = Phase.GREEDY
-        caps = {dominant_id: batch_n}
-        for j in ranked[1:]:
-            assert_jo_dict(j)
-            caps[str(j["id"])] = 0
-
-    for j in ranked:
-        assert_jo_dict(j)
-        caps.setdefault(str(j["id"]), 0)
-
-    # Invariant: 50–50 only when delta ≤ 0.04 and JO-1 not saturated — enforced by branch order above.
+    layers, caps = _build_layer_specs(ranked, batch_n)
+    top_pool_dbg = layers[0]["slot_count"] if layers else None
+    next_pool_dbg = batch_n - top_pool_dbg if top_pool_dbg is not None else None
 
     return (
-        phase,
+        Phase.LAYERED,
         caps,
         delta,
         dominant_id,
@@ -278,11 +336,16 @@ def _compute_phase_and_caps(
         top2_sat,
         top_pool_dbg,
         next_pool_dbg,
+        layers,
     )
 
 
 def _lateral_jo_ids(jos: dict[str, dict]) -> list[str]:
-    return [jid for jid, j in jos.items() if str(j.get("type", "")).strip().upper() == JOType.LATERAL.value]
+    return [
+        jid
+        for jid, j in jos.items()
+        if str(j.get("type", "")).strip().upper() in (JOType.LATERAL.value, JOType.ELTP.value)
+    ]
 
 
 def _ensure_utf8_stdout() -> None:
@@ -305,21 +368,6 @@ def _cap_remaining_batch(jo: dict, caps: dict[str, int], lateral_counts: dict[st
     return max(0, caps.get(jid, 0) - lateral_counts.get(jid, 0))
 
 
-def _max_slots_under_saturation_lifetime(jo: dict) -> int:
-    """Max slots at or below saturation ratio (P0/P1 75%, P2/ELTP 50%)."""
-    assert_jo_dict(jo)
-    init = safe_int(jo.get("initial_demand"), 0)
-    if init <= 0:
-        return 0
-    thr = saturation_threshold_for_jo(jo)
-    return min(init, int(math.floor(thr * init + 1e-12)))
-
-
-def _slots_remaining_under_share_cap(jo: dict) -> int:
-    now = safe_int(jo.get("slots_allocated"), 0)
-    return max(0, _max_slots_under_saturation_lifetime(jo) - now)
-
-
 def _lateral_valid_for_slot(
     jo: dict,
     slot: Slot,
@@ -327,11 +375,11 @@ def _lateral_valid_for_slot(
     lateral_counts: dict[str, int],
     *,
     enforce_positive_batch_cap: bool,
-    skip_lifetime_share_cap: bool = False,
 ) -> tuple[bool, str]:
     assert_jo_dict(jo)
-    if str(jo.get("type", "")).strip().upper() != JOType.LATERAL.value:
-        return False, "not lateral"
+    jo_type = str(jo.get("type", "")).strip().upper()
+    if jo_type not in (JOType.LATERAL.value, JOType.ELTP.value):
+        return False, "not eligible type"
     if not _match_tech_level(jo, slot):
         return False, "tech/level mismatch"
     if safe_int(jo.get("active_demand"), 0) <= 0:
@@ -345,9 +393,6 @@ def _lateral_valid_for_slot(
         return False, "no batch cap reserved for this JO"
     if batch_cap > 0 and lateral_counts.get(jid, 0) >= batch_cap:
         return False, "batch cap exhausted"
-    # In 60–40 phase, lifetime ratio is expressed by batch caps only — do not double-block top/next pools.
-    if not skip_lifetime_share_cap and _slots_remaining_under_share_cap(jo) <= 0:
-        return False, "lifetime share cap (Greedy/50–50 throttle)"
     return True, "OK"
 
 
@@ -366,25 +411,25 @@ def _pick_best_lateral_for_slot(
     slot: Slot,
     caps: dict[str, int],
     lateral_counts: dict[str, int],
+    layer_specs: list[dict],
 ) -> tuple[dict | None, str, list[str]]:
     """
-    Step 7: Route slot to top pool (JO-1/JO-2) or next pool (remainder leaders) by batch index; argmax final_score.
-    No first-fit scan — only candidates allowed for that pool, then best score.
+    Layered routing by batch index. Each layer defines its own candidate set based on
+    ranking + delta + saturation splits. Highest final_score wins within the layer's caps.
     """
     log: list[str] = [f"Slot {slot.slot_id} (batch position {slot_idx + 1}/{batch_n}):", ""]
-    if phase_label == Phase.SPLIT_60_40:
-        top_pool_sz, _ = _top_next_pool_sizes(batch_n)
-        in_top = slot_idx < top_pool_sz
-        log.append(
-            f"Routing: {'Top pool (60% tier) — JO-1 & JO-2 only' if in_top else 'Next pool (40% tier) — next competing JO(s)'}"
-        )
-    else:
-        in_top = True
-        log.append(
-            "Routing: Greedy (JO-1 only)"
-            if phase_label == Phase.GREEDY
-            else "Routing: 50–50 equal group (no top/next pool split by slot index)"
-        )
+    if not layer_specs:
+        log.append("Routing: no layer specs available.")
+        return None, "none", log
+
+    cumulative = 0
+    layer_idx = 0
+    for i, layer in enumerate(layer_specs):
+        cumulative += int(layer["slot_count"])
+        if slot_idx < cumulative:
+            layer_idx = i
+            break
+    log.append(f"Routing: layer {layer_idx + 1}/{len(layer_specs)}")
 
     def score_for(jo: dict) -> float:
         return final_score(jo, slot.project)
@@ -396,8 +441,6 @@ def _pick_best_lateral_for_slot(
             f"{jo['id']} → base {bd['base_score']:.2f} + 0.10×{aff:.1f} = {bd['final_score']:.2f}"
         )
 
-    skip_share = phase_label == Phase.SPLIT_60_40
-
     def valid_ok(pool: list[dict]) -> list[dict]:
         return [
             jo
@@ -408,68 +451,45 @@ def _pick_best_lateral_for_slot(
                 caps,
                 lateral_counts,
                 enforce_positive_batch_cap=True,
-                skip_lifetime_share_cap=skip_share,
             )[0]
         ]
 
-    primary: list[dict] = []
-    if phase_label == Phase.GREEDY:
-        primary = ranked[:1]
-    elif phase_label == Phase.SPLIT_50_50:
-        primary = _equal_group_from_ranked(ranked)
-    elif phase_label == Phase.SPLIT_60_40:
-        # Strict pools: top tier = global JO-1 & JO-2; next tier = top two among ranked[2:] (score + delta caps).
-        if in_top:
-            primary = ranked[:2] if len(ranked) >= 2 else ranked[:1]
-        else:
-            primary = list(_next_tier_top_two(ranked))
-    else:
-        primary = ranked[:1]
+    pick_kind = "layer"
+    for idx in range(layer_idx, len(layer_specs)):
+        layer = layer_specs[idx]
+        candidate_ids = set(layer["candidate_ids"])
+        primary = [jo for jo in ranked if str(jo["id"]) in candidate_ids]
 
-    log.append("Candidates (restricted pool):")
-    if not primary:
-        log.append("  (none)")
-    for jo in primary:
-        ok, why = _lateral_valid_for_slot(
-            jo,
-            slot,
-            caps,
-            lateral_counts,
-            enforce_positive_batch_cap=True,
-            skip_lifetime_share_cap=skip_share,
-        )
-        line = describe_candidate(jo)
-        if not ok:
-            line += f"  [not eligible: {why}]"
-        log.append(f"  {line}")
-
-    log.append("Caps remaining (batch reservation):")
-    for jo in primary:
-        jid = str(jo["id"])
-        br = _cap_remaining_batch(jo, caps, lateral_counts) if caps.get(jid, 0) > 0 else 0
-        log.append(f"  {jid} → {br}")
-
-    valid_p = valid_ok(primary)
-    pick_kind = "pool"
-
-    if not valid_p:
-        log.append("No valid candidate in pool — no cross-pool / overflow bypass (strict).")
-        feas = [
-            jo
-            for jo in primary
-            if _match_tech_level(jo, slot) and safe_int(jo.get("active_demand"), 0) > 0
-        ]
-        if not feas:
-            log.append("True infeasibility (tech mismatch or zero demand for pool JOs) → ELTP path.")
-        else:
-            log.append(
-                "Pool JOs have tech+demand but none passed validation (e.g. batch cap exhausted) → ELTP path."
+        log.append(f"Candidates (layer {idx + 1}):")
+        if not primary:
+            log.append("  (none)")
+        for jo in primary:
+            ok, why = _lateral_valid_for_slot(
+                jo,
+                slot,
+                caps,
+                lateral_counts,
+                enforce_positive_batch_cap=True,
             )
-        return None, "none", log
+            line = describe_candidate(jo)
+            if not ok:
+                line += f"  [not eligible: {why}]"
+            log.append(f"  {line}")
 
-    best = max(valid_p, key=score_for)
-    log.append(f"Selected: {best['id']} (best final_score in allowed set)")
-    return best, pick_kind, log
+        log.append("Caps remaining (batch reservation):")
+        for jo in primary:
+            jid = str(jo["id"])
+            br = _cap_remaining_batch(jo, caps, lateral_counts) if caps.get(jid, 0) > 0 else 0
+            log.append(f"  {jid} → {br}")
+
+        valid_p = valid_ok(primary)
+        if valid_p:
+            best = max(valid_p, key=score_for)
+            log.append(f"Selected: {best['id']} (best final_score in allowed set)")
+            return best, pick_kind, log
+
+    log.append("No valid candidate in any layer.")
+    return None, "none", log
 
 
 def can_assign_lateral_explain(
@@ -485,7 +505,6 @@ def can_assign_lateral_explain(
         caps,
         lateral_counts,
         enforce_positive_batch_cap=(caps.get(jid, 0) > 0),
-        skip_lifetime_share_cap=False,
     )
 
 
@@ -512,7 +531,7 @@ def _try_lateral_fallback_score_order(
     lateral_counts: dict[str, int],
 ) -> dict | None:
     """
-    After strict pool routing fails: try laterals in descending base score (eligible first).
+    After layer routing fails: try candidates in descending base score (eligible first).
     Priority is reflected in base_score — no separate tier ordering.
     """
     ordered_ids = sorted(lateral_ids, key=lambda jid: _lateral_sort_key(jos[jid]))
@@ -524,34 +543,14 @@ def _try_lateral_fallback_score_order(
 
 
 def _lateral_assignment_reason(phase: str, affinity_match: bool, pick_kind: str) -> str:
-    parts = [f"Lateral: best final_score after top/next pool routing ({pick_kind})"]
-    if phase == Phase.SPLIT_50_50:
-        parts.append("50–50 phase caps")
-    elif phase == Phase.SPLIT_60_40:
-        parts.append("60–40 phase caps (top pool + next pool)")
-    else:
-        parts.append("Greedy phase cap on dominant")
+    parts = [f"Assignment: best final_score after layered routing ({pick_kind})"]
+    if phase == Phase.LAYERED:
+        parts.append("layered split caps")
+    elif phase == Phase.GREEDY:
+        parts.append("greedy cap on dominant")
     if affinity_match:
         parts.append("project match (affinity)")
     return " | ".join(parts)
-
-
-def _make_eltp_picker(jos: dict[str, dict]):
-    rr = [0]
-
-    def next_eltp() -> str | None:
-        alive = sorted(
-            jid
-            for jid, j in jos.items()
-            if str(j["type"]).strip().upper() == JOType.ELTP.value and safe_int(j.get("active_demand"), 0) > 0
-        )
-        if not alive:
-            return None
-        idx = rr[0] % len(alive)
-        rr[0] += 1
-        return alive[idx]
-
-    return next_eltp
 
 
 def _print_jo_state(label: str, jo: dict) -> None:
@@ -580,9 +579,9 @@ def _print_delta_block(
         )
         print("Threshold = 0.040")
         if delta_val <= DELTA_EQUAL:
-            print("|Δ| ≤ 0.040 (equal tier); final phase also depends on top1/top2 saturation — see Phase Decision.")
+            print("|Δ| ≤ 0.040 (equal tier); layer split will be 50–50 for that pool.")
         else:
-            print("\u2192 |Δ| > 0.040 \u2192 Greedy if top1 not saturated, else 60–40")
+            print("\u2192 |Δ| > 0.040 \u2192 dominant gets full pool for that layer.")
     else:
         print("Delta: n/a (single lateral competitor)")
         print("Threshold = 0.040")
@@ -590,7 +589,7 @@ def _print_delta_block(
 
 def _lateral_jo_roster_lines(sorted_lateral_jos: list[dict], ref_project: str) -> list[str]:
     """Full score visibility at batch start (affinity uses ref_project for display only)."""
-    lines: list[str] = ["Lateral JO roster (scores at batch start):", ""]
+    lines: list[str] = ["Candidate JO roster (scores at batch start):", ""]
     for jo in sorted_lateral_jos:
         assert_jo_dict(jo)
         jid = str(jo["id"])
@@ -623,6 +622,9 @@ def _build_batch_debug_log(
     batch_size: int,
     total_lateral: int,
     leftover: int,
+    total_slots: int,
+    allocated_slots: int,
+    pending_slots: int,
     eltp_tally: dict[str, int],
     ratios: dict[str, float],
     fairness: float,
@@ -643,27 +645,27 @@ def _build_batch_debug_log(
         )
         lines.append("Threshold = 0.040")
         lines.append(
-            "Phase rule: both top saturated → controlled split (Case A/B); "
-            "else |Δ|≤0.04 → 50–50; else Greedy if top1 free; else Case B split."
+            "Layer rule: delta chooses competitors; saturation band (dominant) sizes the pool; "
+            "|Δ|≤0.04 → 50–50 inside the pool, else dominant gets the pool."
         )
     else:
-        lines.append("Delta: n/a (single or no lateral competitor)")
+        lines.append("Delta: n/a (single or no competitor)")
         lines.append("Threshold = 0.040")
     lines.append("")
-    lines.append("Saturation (lateral, before batch):")
+    lines.append("Saturation (candidates, before batch):")
     lines.extend(lateral_sat_lines)
     lines.append("")
     lines.extend(roster_lines)
-    lines.append("Phase Decision:")
-    lines.append(f"Phase: {phase_label}")
+    lines.append("Layer Decision:")
+    lines.append(f"Mode: {phase_label}")
     lines.append(f"Top1 Sat: {top1_sat}, Top2 Sat: {top2_sat}")
     lines.append(f"Delta: {delta_val}")
-    if phase_label == Phase.SPLIT_60_40 and top_pool_dbg is not None and next_pool_dbg is not None:
-        lines.append("60–40 Split:")
+    if phase_label == Phase.LAYERED and top_pool_dbg is not None and next_pool_dbg is not None:
+        lines.append("Top Pool Split:")
         lines.append(f"Top Pool: {top_pool_dbg}")
-        lines.append(f"Next Pool: {next_pool_dbg}")
+        lines.append(f"Remaining Pool: {next_pool_dbg}")
     lines.append("")
-    lines.append("Batch cap vs demand (lateral) - effective_cap = min(batch_cap, active_demand) at batch start:")
+    lines.append("Batch cap vs demand (effective_cap = min(batch_cap, active_demand) at batch start):")
     for jid in sorted(caps.keys()):
         tcap = caps[jid]
         if tcap <= 0:
@@ -678,7 +680,7 @@ def _build_batch_debug_log(
         if unusable > 0:
             lines.append(f"    Theoretical cap not usable (demand < cap): {unusable}")
     lines.append("")
-    lines.append("Lateral allocation (this batch, demand-constrained):")
+    lines.append("Allocation (this batch, demand-constrained):")
     printed_caps: set[str] = set()
     for jid in sorted(caps.keys()):
         if caps[jid] <= 0:
@@ -702,16 +704,11 @@ def _build_batch_debug_log(
             f"  {jid}: assigned = {a} (advisory batch cap 0; slots taken after reserved-cap laterals could not)"
         )
     lines.append(f"Batch size: {batch_size}")
-    lines.append(f"Total lateral assigned: {total_lateral}")
-    lines.append(f"Leftover (batch_size - lateral assigned, => ELTP if > 0): {leftover}")
-    lines.append("")
-    lines.append("ELTP allocation (this batch, leftover only):")
-    if not any(v > 0 for v in eltp_tally.values()):
-        lines.append("  (none)")
-    else:
-        for jid in sorted(eltp_tally.keys()):
-            if eltp_tally[jid] > 0:
-                lines.append(f"  {jid} => {eltp_tally[jid]}")
+    lines.append(f"Total slots: {total_slots}")
+    lines.append(f"Allocated slots: {allocated_slots}")
+    lines.append(f"Pending slots: {pending_slots}")
+    lines.append(f"Running Pending Slots After Batch: {pending_slots}")
+    lines.append(f"Leftover (batch_size - assigned): {leftover}")
     lines.append("")
     lines.append("Lateral ratios (after batch, slots / initial_demand):")
     for jid in sorted(ratios.keys()):
@@ -741,12 +738,12 @@ def run_allocation(
     breakdown: dict[tuple[str, str], dict[str, float]] = {}
 
     slot_list = list(slots)
+    total_slots = len(slot_list)
     batches: list[list[Slot]] = []
     for i in range(0, len(slot_list), batch_size):
         batches.append(slot_list[i : i + batch_size])
 
     batch_debug: list[BatchDebugInfo] = []
-    pick_eltp = _make_eltp_picker(jos)
     cumulative: dict[str, int] = {jid: 0 for jid in jos}
 
     for bi, batch_slots in enumerate(batches):
@@ -768,6 +765,7 @@ def run_allocation(
             top2_sat,
             top_pool_dbg,
             next_pool_dbg,
+            layer_specs,
         ) = _compute_phase_and_caps(eligible_batch, n)
         for jid in lateral_ids:
             caps.setdefault(jid, 0)
@@ -777,42 +775,37 @@ def run_allocation(
         }
 
         sat_map = {jid: saturation_pct(jos[jid]) for jid in jos}
-        thresh_map = {jid: 100.0 * saturation_threshold_for_jo(jos[jid]) for jid in jos}
+        thresh_map: dict[str, float] = {}
         base_snapshot = {jid: base_score(jos[jid]) for jid in lateral_ids}
         lateral_batch_counts: dict[str, int] = {jid: 0 for jid in lateral_ids}
-        eltp_batch_counts: dict[str, int] = {
-            jid: 0
-            for jid, j in jos.items()
-            if str(j.get("type", "")).strip().upper() == JOType.ELTP.value
-        }
+        eltp_batch_counts: dict[str, int] = {}
 
         lateral_sat_lines = []
         for jid in sorted(lateral_ids):
             j = jos[jid]
-            thr = 100.0 * saturation_threshold_for_jo(j)
-            if safe_int(j.get("slots_allocated"), 0) == 0:
-                lateral_sat_lines.append(f"  {jid} = INACTIVE (threshold {thr:.0f}%)")
-            else:
-                sp = saturation_ratio(j) * 100.0
-                lateral_sat_lines.append(f"  {jid} = {sp:.1f}% ACTIVE (threshold {thr:.0f}%)")
+            sp = saturation_ratio(j) * 100.0
+            _, band_label, split_rule, _ = get_saturation_band(j)
+            lateral_sat_lines.append(
+                f"  {jid} = {sp:.1f}% | Band: {band_label} | Split Rule: {split_rule}"
+            )
 
         print("\n" + "=" * 60)
         print(f"Batch ID: {bi}")
-        print("- Lateral pool only: ranking, delta, caps (ELTP excluded) -")
+        print("- Candidate pool: ranking, delta, caps (ELTP included) -")
         _print_delta_block(dom_id, top_bs, next_id, second_bs, delta_val)
         print("")
-        print("Saturation (lateral JOs, start of batch):")
+        print("Saturation (candidate JOs, start of batch):")
         for line in lateral_sat_lines:
             print(line)
         print("")
-        print("Phase Decision:")
-        print(f"Phase: {phase_label}")
+        print("Layer Decision:")
+        print(f"Mode: {phase_label}")
         print(f"Top1 Sat: {top1_sat}, Top2 Sat: {top2_sat}")
         print(f"Delta: {delta_val}")
-        if phase_label == Phase.SPLIT_60_40 and top_pool_dbg is not None and next_pool_dbg is not None:
-            print("60–40 Split:")
+        if phase_label == Phase.LAYERED and top_pool_dbg is not None and next_pool_dbg is not None:
+            print("Top Pool Split:")
             print(f"Top Pool: {top_pool_dbg}")
-            print(f"Next Pool: {next_pool_dbg}")
+            print(f"Remaining Pool: {next_pool_dbg}")
         print("")
         print("Batch cap vs demand (effective_cap = min(batch_cap, active_demand)):")
         for ck, cv in sorted(caps.items()):
@@ -832,12 +825,11 @@ def run_allocation(
         for ln in roster_lines:
             print(ln)
         batch_slot_assignments: list[SlotAssignment | None] = [None] * n
-        eltp_slots_this_batch = 0
 
         for idx, slot in enumerate(batch_slots):
             print("")
             print(f"Slot ID: {slot.slot_id}")
-            print("- Per-slot scores (each lateral vs this slot) -")
+            print("- Per-slot scores (each candidate vs this slot) -")
             for jo in sorted_lateral_jos:
                 jid = str(jo["id"])
                 bd = score_breakdown(jos[jid], slot.project)
@@ -859,7 +851,7 @@ def run_allocation(
                 )
                 print("")
 
-            print("---- SLOT TRACE (pool route → filter → argmax final_score) ----")
+            print("---- SLOT TRACE (layer route → filter → argmax final_score) ----")
             picked, pick_kind, trace_lines = _pick_best_lateral_for_slot(
                 phase_label,
                 eligible_batch,
@@ -868,12 +860,13 @@ def run_allocation(
                 slot,
                 caps,
                 lateral_counts,
+                layer_specs,
             )
             for line in trace_lines:
                 print(line)
-            if phase_label == Phase.SPLIT_60_40:
+            if phase_label == Phase.LAYERED:
                 print(
-                    "60–40 batch: top two share top pool; next pool = top two among remainder by score/delta (caps)."
+                    "Layered batch: delta picks competitors, saturation bands size the pool for each layer."
                 )
 
             assigned_jo_id: str | None = None
@@ -911,7 +904,7 @@ def run_allocation(
                     jid = str(fb["id"])
                     print(
                         "Structured fallback (base score desc, first can_assign): "
-                        f"pool routing had no winner → assigning {jid}"
+                        f"layer routing had no winner → assigning {jid}"
                     )
                     lateral_counts[jid] += 1
                     lateral_batch_counts[jid] += 1
@@ -921,9 +914,7 @@ def run_allocation(
                     assigned_jo["active_demand"] = max(0, safe_int(assigned_jo.get("active_demand"), 0) - 1)
                     fs = final_score(assigned_jo, slot.project)
                     aff = str(assigned_jo["project"]).strip() == slot.project.strip()
-                    reason = (
-                        "Lateral: structured score-order fallback (after pool route; before ELTP)"
-                    )
+                    reason = "Fallback: structured score-order (after layer route)"
                     sat_after = saturation_ratio(assigned_jo)
                     print(f"  Saturation after assign: {sat_after:.4f}")
                     _print_jo_state("Updated", assigned_jo)
@@ -943,43 +934,23 @@ def run_allocation(
                     can_assign_lateral(jos[jid], slot, caps, lateral_counts) for jid in lateral_ids
                 )
                 if any_demand and not still_eligible:
-                    print("Note: lateral demand > 0 but no lateral can_assign this slot (caps/tech/share).")
+                    print("Note: demand > 0 but no candidate can_assign this slot (caps/tech).")
                 if still_eligible:
-                    print("ERROR: lateral available (can_assign) but none assigned (logic bug).")
-                print("No lateral eligible → assigning to ELTP")
-                eid = pick_eltp()
-                if eid is not None:
-                    eltp_slots_this_batch += 1
-                    eltp_batch_counts[eid] = eltp_batch_counts[eid] + 1
-                    cumulative[eid] += 1
-                    assigned_jo = jos[eid]
-                    assigned_jo["slots_allocated"] = safe_int(assigned_jo.get("slots_allocated"), 0) + 1
-                    assigned_jo["active_demand"] = max(0, safe_int(assigned_jo.get("active_demand"), 0) - 1)
-                    print(f"  Assigned JO: {eid} (ELTP — no lateral eligible for this slot)")
-                    _print_jo_state("Updated", assigned_jo)
-                    batch_slot_assignments[idx] = SlotAssignment(
-                        slot_id=slot.slot_id,
-                        jo_id=eid,
-                        allocation_type="ELTP",
-                        reason="ELTP (no lateral could assign; infeasibility fallback)",
-                        final_score=None,
-                        affinity_match=None,
-                    )
-                else:
-                    print(f"  Unassigned - no ELTP capacity ({last_lateral_fail_reason})")
-                    batch_slot_assignments[idx] = SlotAssignment(
-                        slot_id=slot.slot_id,
-                        jo_id="-",
-                        allocation_type="Unassigned",
-                        reason=last_lateral_fail_reason,
-                        final_score=None,
-                        affinity_match=None,
-                    )
+                    print("ERROR: candidate available (can_assign) but none assigned (logic bug).")
+                print("No candidate eligible → unassigned")
+                batch_slot_assignments[idx] = SlotAssignment(
+                    slot_id=slot.slot_id,
+                    jo_id="-",
+                    allocation_type="Unassigned",
+                    reason=last_lateral_fail_reason,
+                    final_score=None,
+                    affinity_match=None,
+                )
 
         total_lateral_assigned = sum(lateral_counts.values())
         leftover = n - total_lateral_assigned
         print("")
-        print("- Lateral result vs demand -")
+        print("- Allocation result vs demand -")
         printed_result: set[str] = set()
         for ck, cv in sorted(caps.items()):
             if cv <= 0:
@@ -1004,19 +975,18 @@ def run_allocation(
                 continue
             jo = jos[ck]
             print(f"  {jo['id']}: assigned = {assigned} (advisory batch cap 0; saturation/overflow path)")
-        print(f"Batch size: {n} | Total lateral assigned: {total_lateral_assigned}")
-        print(f"Leftover = batch_size - lateral assigned = {n} - {total_lateral_assigned} = {leftover}")
-        if leftover > 0:
-            print(
-                "  => ELTP only for slots where every lateral failed can_assign (not a priority shortcut)."
-            )
+        print(f"Batch size: {n} | Total assigned: {total_lateral_assigned}")
+        print(f"Leftover = batch_size - assigned = {n} - {total_lateral_assigned} = {leftover}")
 
         assert all(a is not None for a in batch_slot_assignments)
         assignments.extend(batch_slot_assignments)  # type: ignore[arg-type]
+        allocated_slots = sum(1 for a in assignments if a.jo_id != "-")
+        pending_slots = total_slots - allocated_slots
+        print(f"Pending Slots: {pending_slots}")
+        print(f"Allocated Slots: {allocated_slots}")
+        print(f"Total Slots: {total_slots}")
 
         print("")
-        print(f"ELTP assigned (this batch): {eltp_slots_this_batch}")
-        print("(ELTP only if no lateral could take the slot after full base-score order scan.)")
 
         lat_rat = lateral_ratios(jos)
         fair_b = fairness_lateral_range(jos)
@@ -1037,6 +1007,9 @@ def run_allocation(
             n,
             total_lateral_assigned,
             leftover,
+            total_slots,
+            allocated_slots,
+            pending_slots,
             {k: v for k, v in eltp_batch_counts.items() if v > 0},
             lat_rat,
             fair_b,
