@@ -11,7 +11,7 @@ import streamlit as st
 from engine import BATCH_SIZE, DELTA_EQUAL, run_allocation
 from jo_utils import assert_jo_dict, safe_int
 from metrics import build_metrics_styled_table, demand_fulfilled_pct, fairness_lateral
-from models import Slot
+from models import SimulationResult, Slot
 from scoring import base_score
 
 st.set_page_config(page_title="Slot Allocation Simulator", layout="wide")
@@ -20,14 +20,12 @@ st.set_page_config(page_title="Slot Allocation Simulator", layout="wide")
 def default_jos() -> list[dict]:
     return [
         {
-            # JO-A: P0. High urgency. initial_demand=8 → sat cap = 6 slots (75%).
-            # Dominates early. Saturates by end of Batch 2.
             "id": "JO-A-P0",
             "priority": 0,
-            "days_remaining": 3,
-            "total_duration": 30,
-            "initial_demand": 8,
-            "active_demand": 8,
+            "days_remaining": 10,
+            "total_duration": 60,
+            "initial_demand": 15,
+            "active_demand": 15,
             "project": "Alpha",
             "type": "LATERAL",
             "tech_stack": "*",
@@ -35,16 +33,12 @@ def default_jos() -> list[dict]:
             "slots_allocated": 0,
         },
         {
-            # JO-B: P0. Same priority as JO-A. days_remaining=4 vs JO-A's 3.
-            # Initial base scores: JO-A=0.875, JO-B=0.858. Delta=0.017 ≤ 0.040.
-            # This triggers 50-50 Equal in Batch 1 immediately.
-            # initial_demand=8 → sat cap = 6 slots (75%).
             "id": "JO-B-P0",
             "priority": 0,
-            "days_remaining": 4,
-            "total_duration": 30,
-            "initial_demand": 8,
-            "active_demand": 8,
+            "days_remaining": 15,
+            "total_duration": 60,
+            "initial_demand": 15,
+            "active_demand": 15,
             "project": "Beta",
             "type": "LATERAL",
             "tech_stack": "*",
@@ -52,12 +46,10 @@ def default_jos() -> list[dict]:
             "slots_allocated": 0,
         },
         {
-            # JO-C: P1. Competes after JO-A and JO-B saturate.
-            # initial_demand=8 → sat cap = 6 slots (75%).
             "id": "JO-C-P1",
             "priority": 1,
-            "days_remaining": 5,
-            "total_duration": 30,
+            "days_remaining": 30,
+            "total_duration": 60,
             "initial_demand": 8,
             "active_demand": 8,
             "project": "Alpha",
@@ -67,14 +59,12 @@ def default_jos() -> list[dict]:
             "slots_allocated": 0,
         },
         {
-            # JO-D: P2. Low saturation cap (50% of 6 = 3 slots max).
-            # Receives overflow once P0/P1 JOs are capped out.
-            "id": "JO-D-P2",
-            "priority": 2,
-            "days_remaining": 6,
-            "total_duration": 30,
-            "initial_demand": 6,
-            "active_demand": 6,
+            "id": "JO-D-P1",
+            "priority": 1,
+            "days_remaining": 30,
+            "total_duration": 60,
+            "initial_demand": 8,
+            "active_demand": 8,
             "project": "Gamma",
             "type": "LATERAL",
             "tech_stack": "*",
@@ -82,14 +72,12 @@ def default_jos() -> list[dict]:
             "slots_allocated": 0,
         },
         {
-            # JO-E: P2. Same priority and same urgency as JO-D (both days_remaining=6) so base scores stay tied.
-            # initial_demand=6 → sat cap = 3 slots (50%).
             "id": "JO-E-P2",
             "priority": 2,
-            "days_remaining": 6,
-            "total_duration": 30,
-            "initial_demand": 6,
-            "active_demand": 6,
+            "days_remaining": 60,
+            "total_duration": 120,
+            "initial_demand": 4,
+            "active_demand": 4,
             "project": "Delta",
             "type": "LATERAL",
             "tech_stack": "*",
@@ -97,16 +85,25 @@ def default_jos() -> list[dict]:
             "slots_allocated": 0,
         },
         {
-            # JO-F: ELTP. Large demand (30). Only receives slots when ALL
-            # laterals have either exhausted demand or hit saturation.
-            # With laterals capped at 6+6+6+3+3=24 total and 28 slots,
-            # the last 4 slots must fall to ELTP.
-            "id": "JO-F-ELTP",
+            "id": "JO-F-P2",
             "priority": 2,
-            "days_remaining": 20,
-            "total_duration": 60,
-            "initial_demand": 30,
-            "active_demand": 30,
+            "days_remaining": 60,
+            "total_duration": 120,
+            "initial_demand": 4,
+            "active_demand": 4,
+            "project": "Gamma",
+            "type": "LATERAL",
+            "tech_stack": "*",
+            "level": "*",
+            "slots_allocated": 0,
+        },
+        {
+            "id": "JO-G-ELTP",
+            "priority": 2,
+            "days_remaining": 120,
+            "total_duration": 120,
+            "initial_demand": 40,
+            "active_demand": 40,
             "project": "Bench",
             "type": "ELTP",
             "tech_stack": "*",
@@ -117,56 +114,88 @@ def default_jos() -> list[dict]:
 
 
 def default_slots() -> list[Slot]:
-    raw = [
-        # Batch 1 — 50-50 Equal (JO-A and JO-B both P0, delta=0.017 ≤ 0.040)
-        {"slot_id": "S01", "panel": "P01", "project": "Alpha", "batch": 1},
-        {"slot_id": "S02", "panel": "P02", "project": "Beta", "batch": 1},
-        {"slot_id": "S03", "panel": "P03", "project": "Alpha", "batch": 1},
-        {"slot_id": "S04", "panel": "P04", "project": "Beta", "batch": 1},
-        # Batch 2 — 50-50 Equal again (both still unsaturated, delta still ≤ 0.040)
-        {"slot_id": "S05", "panel": "P05", "project": "Alpha", "batch": 2},
-        {"slot_id": "S06", "panel": "P06", "project": "Beta", "batch": 2},
-        {"slot_id": "S07", "panel": "P07", "project": "Alpha", "batch": 2},
-        {"slot_id": "S08", "panel": "P08", "project": "Beta", "batch": 2},
-        # Batch 3 — 50-50 then saturation gate mid-batch
-        {"slot_id": "S09", "panel": "P09", "project": "Alpha", "batch": 3},
-        {"slot_id": "S10", "panel": "P10", "project": "Beta", "batch": 3},
-        {"slot_id": "S11", "panel": "P11", "project": "Alpha", "batch": 3},
-        {"slot_id": "S12", "panel": "P12", "project": "Beta", "batch": 3},
-        # Batch 4 — 60-40 phase (dominant saturated; competing JO gets remainder)
-        {"slot_id": "S13", "panel": "P13", "project": "Alpha", "batch": 4},
-        {"slot_id": "S14", "panel": "P14", "project": "Beta", "batch": 4},
-        {"slot_id": "S15", "panel": "P15", "project": "Gamma", "batch": 4},
-        {"slot_id": "S16", "panel": "P16", "project": "Delta", "batch": 4},
-        # Batch 5 — 60-40 continues until P0/P1 are all saturated
-        {"slot_id": "S17", "panel": "P17", "project": "Alpha", "batch": 5},
-        {"slot_id": "S18", "panel": "P18", "project": "Beta", "batch": 5},
-        {"slot_id": "S19", "panel": "P19", "project": "Gamma", "batch": 5},
-        {"slot_id": "S20", "panel": "P20", "project": "Delta", "batch": 5},
-        # Batch 6 — P2 50-50 Equal (JO-D-P2 and JO-E-P2 top two, delta ≤ 0.040)
-        {"slot_id": "S21", "panel": "P21", "project": "Gamma", "batch": 6},
-        {"slot_id": "S22", "panel": "P22", "project": "Delta", "batch": 6},
-        {"slot_id": "S23", "panel": "P23", "project": "Gamma", "batch": 6},
-        {"slot_id": "S24", "panel": "P24", "project": "Delta", "batch": 6},
-        # Batch 7 — ELTP fallback (all laterals saturated or demand = 0)
-        {"slot_id": "S25", "panel": "P25", "project": "Bench", "batch": 7},
-        {"slot_id": "S26", "panel": "P26", "project": "Bench", "batch": 7},
-        {"slot_id": "S27", "panel": "P27", "project": "Bench", "batch": 7},
-        {"slot_id": "S28", "panel": "P28", "project": "Bench", "batch": 7},
-    ]
+    projects = ["Alpha", "Beta", "Gamma", "Delta", "Bench"]
     out: list[Slot] = []
-    for row in raw:
+    for i in range(1, 51):
+        proj = projects[(i - 1) % len(projects)]
         out.append(
             Slot(
-                slot_id=row["slot_id"],
-                panel_id=row["panel"],
-                project=row["project"],
+                slot_id=f"S{i:02d}",
+                panel_id=f"P{i:02d}",
+                project=proj,
                 tech_stack="*",
                 level="*",
-                batch_id=str(row["batch"]),
+                batch_id="1",
             )
         )
     return out
+
+
+def parse_batch_sizes(raw: str) -> list[int]:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    sizes: list[int] = []
+    for part in parts:
+        try:
+            val = int(part)
+        except ValueError:
+            continue
+        if val > 0:
+            sizes.append(val)
+    return sizes
+
+
+def run_dynamic_simulation(
+    jos: list[dict], slots: list[Slot], batch_sizes: list[int]
+) -> tuple[SimulationResult, list[int]]:
+    if not batch_sizes:
+        raise ValueError("Dynamic batch sizes must include at least one positive integer.")
+    total_slots = len(slots)
+    used_sizes: list[int] = []
+    assignments = []
+    batch_debug = []
+    breakdown: dict[tuple[str, str], dict[str, float]] = {}
+    final_matrix: dict[tuple[str, str], float] = {}
+    base_initial = {jo["id"]: base_score(jo) for jo in jos}
+    dom_id_initial = None
+    comp_id_initial = None
+    slot_idx = 0
+    batch_offset = 0
+    cumulative: dict[str, int] = {}
+
+    while slot_idx < total_slots:
+        size = batch_sizes[len(used_sizes) % len(batch_sizes)]
+        batch_slots = slots[slot_idx : slot_idx + size]
+        if not batch_slots:
+            break
+        result = run_allocation(jos, batch_slots, batch_size=len(batch_slots))
+        if dom_id_initial is None:
+            dom_id_initial = result.lateral_dominant_id_initial
+            comp_id_initial = result.lateral_competing_id_initial
+        assignments.extend(result.assignments)
+        breakdown.update(result.score_breakdown_by_slot_jo)
+        final_matrix.update(result.jo_final_score_matrix)
+
+        for bd in result.batch_debug:
+            bd.batch_index = batch_offset + bd.batch_index
+            cumulative.update(bd.cumulative_slots_assigned)
+            bd.cumulative_slots_assigned = dict(cumulative)
+            batch_debug.append(bd)
+
+        slot_idx += len(batch_slots)
+        used_sizes.append(len(batch_slots))
+        batch_offset += len(result.batch_debug)
+
+    combined = SimulationResult(
+        assignments=assignments,
+        jo_snapshots_end={jo["id"]: jo for jo in jos},
+        batch_debug=batch_debug,
+        jo_base_scores_initial=base_initial,
+        score_breakdown_by_slot_jo=breakdown,
+        jo_final_score_matrix=final_matrix,
+        lateral_dominant_id_initial=dom_id_initial,
+        lateral_competing_id_initial=comp_id_initial,
+    )
+    return combined, used_sizes
 
 
 def _coerce_priority(val) -> str | int:
@@ -267,9 +296,9 @@ def format_slot_breakdown(res, slot_id: str) -> str:
 
 st.title("Slot Allocation Simulator")
 st.caption(
-    "Per slot: try every lateral in base-score order (can_assign: demand, cap, saturation, tech/level; "
-    "affinity is not a gate) → only if none can take the slot, assign ELTP. "
-    f"Delta equal threshold = {DELTA_EQUAL}; batch size = {BATCH_SIZE}. "
+    "Per slot: try every candidate in base-score order (demand, cap, tech/level; "
+    "affinity is not a gate). "
+    f"Delta equal threshold = {DELTA_EQUAL}; default batch size = {BATCH_SIZE}. "
     "Final score = base + 0.10 × affinity (preference only). "
     "Check the terminal for ROW / batch / assignment prints."
 )
@@ -309,7 +338,10 @@ with tab_inputs:
         key="slot_editor",
     )
 
-    batch_n = st.number_input("Slots per batch", min_value=1, max_value=32, value=BATCH_SIZE, step=1)
+    use_dynamic_batches = st.checkbox("Use dynamic batch sizes", value=True)
+    batch_list_default = "4, 10, 2, 15, 40, 8, 6, 5, 10"
+    batch_list_raw = st.text_input("Dynamic batch sizes (comma-separated)", value=batch_list_default)
+    batch_n = st.number_input("Slots per batch (static)", min_value=1, max_value=100, value=BATCH_SIZE, step=1)
 
     run = st.button("Run simulation", type="primary")
 
@@ -320,7 +352,14 @@ if run:
     try:
         jos = jos_from_df(edited_jo)
         slots = slots_from_df(edited_sl)
-        st.session_state.last_result = run_allocation(jos, slots, batch_size=int(batch_n))
+        if use_dynamic_batches:
+            batch_sizes = parse_batch_sizes(batch_list_raw)
+            res, used_sizes = run_dynamic_simulation(jos, slots, batch_sizes)
+            st.session_state.last_result = res
+            st.session_state.batch_sizes_used = used_sizes
+        else:
+            st.session_state.last_result = run_allocation(jos, slots, batch_size=int(batch_n))
+            st.session_state.batch_sizes_used = None
         st.session_state.jo_input_df = edited_jo.copy()
         st.session_state.slot_input_df = edited_sl.copy()
     except Exception as e:
@@ -331,17 +370,32 @@ if run:
         st.session_state.last_result = None
 
 res = st.session_state.last_result
+batch_sizes_used = st.session_state.get("batch_sizes_used")
+if res:
+    total_slots = len(res.assignments)
+    allocated_slots = sum(1 for a in res.assignments if a.jo_id != "-")
+    pending_slots = max(0, total_slots - allocated_slots)
 
 with tab_batch:
     st.subheader("Batch logs (mandatory transparency)")
     if not res:
         st.info("Run the simulation from the Inputs tab.")
     else:
+        st.markdown(
+            f"**Pending Slots:** {pending_slots}  \n"
+            f"**Allocated Slots:** {allocated_slots}  \n"
+            f"**Total Slots:** {total_slots}"
+        )
         for bd in res.batch_debug:
+            pending_after = None
+            if batch_sizes_used is not None and bd.batch_index < len(batch_sizes_used):
+                pending_after = max(0, total_slots - sum(batch_sizes_used[: bd.batch_index + 1]))
             with st.expander(
                 f"Batch {bd.batch_index + 1} — slots: {', '.join(bd.slot_ids)}",
                 expanded=bd.batch_index == 0,
             ):
+                if pending_after is not None:
+                    st.markdown(f"**Running Pending Slots After Batch:** {pending_after}")
                 st.code("\n".join(bd.debug_log_lines), language=None)
                 st.markdown("**Allocation this batch — lateral**")
                 st.json(bd.lateral_assigned_this_batch or {})

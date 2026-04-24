@@ -742,12 +742,20 @@ def run_allocation(
     batches: list[list[Slot]] = []
     for i in range(0, len(slot_list), batch_size):
         batches.append(slot_list[i : i + batch_size])
+    batch_queue = list(batches)
 
     batch_debug: list[BatchDebugInfo] = []
     cumulative: dict[str, int] = {jid: 0 for jid in jos}
 
-    for bi, batch_slots in enumerate(batches):
+    batch_index = 0
+    while batch_queue:
+        batch_slots = batch_queue.pop(0)
+        total_demand = sum(safe_int(j.get("active_demand"), 0) for j in jos.values())
+        if total_demand <= 0:
+            break
         n = len(batch_slots)
+        if n <= 0:
+            continue
         lateral_ids = _lateral_jo_ids(jos)
 
         eligible_batch = _lateral_eligible_for_batch(jos, batch_slots)
@@ -790,7 +798,7 @@ def run_allocation(
             )
 
         print("\n" + "=" * 60)
-        print(f"Batch ID: {bi}")
+        print(f"Batch ID: {batch_index}")
         print("- Candidate pool: ranking, delta, caps (ELTP included) -")
         _print_delta_block(dom_id, top_bs, next_id, second_bs, delta_val)
         print("")
@@ -992,7 +1000,7 @@ def run_allocation(
         fair_b = fairness_lateral_range(jos)
 
         log_lines = _build_batch_debug_log(
-            bi,
+            batch_index,
             dom_id,
             next_id,
             top_bs,
@@ -1025,7 +1033,7 @@ def run_allocation(
 
         batch_debug.append(
             BatchDebugInfo(
-                batch_index=bi,
+                batch_index=batch_index,
                 slot_ids=[s.slot_id for s in batch_slots],
                 lateral_base_scores=base_snapshot,
                 delta_value=delta_val,
@@ -1043,6 +1051,29 @@ def run_allocation(
                 debug_log_lines=log_lines,
             )
         )
+
+        batch_index += 1
+        if leftover > 0:
+            unassigned_slots = [
+                slot
+                for slot, assignment in zip(batch_slots, batch_slot_assignments)
+                if assignment is not None and assignment.jo_id == "-"
+            ]
+            if unassigned_slots:
+                remaining_demand = sum(
+                    safe_int(j.get("active_demand"), 0) for j in jos.values()
+                )
+                if remaining_demand <= 0:
+                    break
+                can_take = any(
+                    can_assign_lateral(jos[jid], slot, caps, lateral_counts)
+                    for slot in unassigned_slots
+                    for jid in lateral_ids
+                )
+                if not can_take:
+                    break
+                if remaining_demand > 0:
+                    batch_queue.insert(0, unassigned_slots)
 
     return SimulationResult(
         assignments=assignments,
