@@ -1,0 +1,7 @@
+{
+  "priority_weight": 0.35,
+  "demand_weight": 0.3,
+  "urgency_weight": 0.25,
+  "affinity_weight": 0.1,
+  "delta_threshold": 0.025
+}

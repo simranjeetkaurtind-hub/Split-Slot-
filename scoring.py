@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from config import get_weight
 from jo_utils import assert_jo_dict, safe_int
 from models import JOType
 
@@ -46,7 +47,11 @@ def base_score(jo: dict) -> float:
     ps = priority_score_from_priority(jo["priority"])
     us = urgency_score(safe_int(jo.get("days_remaining"), 0), safe_int(jo.get("total_duration"), 0))
     ds = demand_score(jo)
-    return 0.40 * ps + 0.25 * us + 0.25 * ds
+    return (
+        get_weight("priority_weight") * ps
+        + get_weight("urgency_weight") * us
+        + get_weight("demand_weight") * ds
+    )
 
 
 def affinity_score_slot(jo: dict, slot_project: str) -> float:
@@ -59,9 +64,13 @@ def score_breakdown(jo: dict, slot_project: str) -> dict[str, float]:
     ps = priority_score_from_priority(jo["priority"])
     us = urgency_score(safe_int(jo.get("days_remaining"), 0), safe_int(jo.get("total_duration"), 0))
     ds = demand_score(jo)
-    base = 0.40 * ps + 0.25 * us + 0.25 * ds
+    base = (
+        get_weight("priority_weight") * ps
+        + get_weight("urgency_weight") * us
+        + get_weight("demand_weight") * ds
+    )
     aff = affinity_score_slot(jo, slot_project)
-    final = base + 0.10 * aff
+    final = base + get_weight("affinity_weight") * aff
     sl = float(safe_int(jo.get("slots_allocated"), 0))
     ad = float(safe_int(jo.get("active_demand"), 0))
     return {
@@ -118,17 +127,17 @@ def get_saturation_band(jo: dict) -> tuple[str, str, str, float]:
     pl = priority_level(jo["priority"])
     if pl in (0, 1):
         if ratio < 0.45:
-            return ("BELOW LOW", "BELOW LOW", "GREEDY (100%)", 1.0)
+            return ("BELOW LOW", "<45%", "GREEDY", 1.0)
         if ratio < 0.65:
-            return ("LOW", "LOW (≥ 45%)", "80:20", 0.80)
+            return ("LOW", "45–65%", "80:20", 0.80)
         if ratio < 0.80:
-            return ("MID", "MID (≥ 65%)", "60:40", 0.60)
-        return ("HIGH", "HIGH (≥ 80%)", "30:70", 0.30)
+            return ("MID", "65–80%", "60:40", 0.60)
+        return ("HIGH", "≥80%", "30:70", 0.30)
     if ratio < 0.25:
-        return ("BELOW LOW", "BELOW LOW", "GREEDY (100%)", 1.0)
+        return ("BELOW LOW", "<25%", "GREEDY", 1.0)
     if ratio < 0.50:
-        return ("LOW", "LOW (≥ 25%)", "80:20", 0.80)
-    return ("HIGH", "HIGH (≥ 50%)", "50:50", 0.50)
+        return ("LOW", "25–50%", "80:20", 0.80)
+    return ("HIGH", "≥50%", "50:50", 0.50)
 
 
 def get_split_ratio(jo: dict) -> tuple[float, float]:
