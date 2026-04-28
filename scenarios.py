@@ -33,7 +33,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-C", 1, 30, 5, "Gamma"),
             ],
             "slots": _make_slots(30, ["Alpha", "Beta", "Gamma"]),
-            "batch_sizes": [5, 5, 10, 10],
+            "batch_sizes": [5, 5, 5, 5, 5, 5],
         },
         {
             "id": "same_priority_equal_demand",
@@ -44,7 +44,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-C", 1, 30, 20, "Gamma"),
             ],
             "slots": _make_slots(30, ["Alpha", "Beta", "Gamma"]),
-            "batch_sizes": [10, 10, 10],
+            "batch_sizes": [5, 5, 5, 5, 5, 5],
         },
         {
             "id": "scarce_slots",
@@ -69,7 +69,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-ELTP", 2, 100, 100, "Bench", jo_type="ELTP"),
             ],
             "slots": _make_slots(100, ["Alpha", "Beta", "Gamma"]),
-            "batch_sizes": [20, 20, 20, 20, 20],
+            "batch_sizes": [5] * 20,
         },
         {
             "id": "mixed_priority_demand",
@@ -83,7 +83,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-ELTP", 2, 50, 50, "Bench", jo_type="ELTP"),
             ],
             "slots": _make_slots(40, ["Alpha", "Beta", "Gamma", "Delta"]),
-            "batch_sizes": [10, 10, 10, 10],
+            "batch_sizes": [5] * 8,
         },
         {
             "id": "saturation_band_test",
@@ -96,7 +96,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-E", 2, 20, 10, "Alpha"),
             ],
             "slots": _make_slots(20, ["Alpha", "Beta", "Gamma", "Delta"]),
-            "batch_sizes": [10, 10],
+            "batch_sizes": [5, 5, 5, 5],
         },
         {
             "id": "p2_vs_p1_demand",
@@ -107,7 +107,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-ELTP", 2, 100, 100, "Bench", jo_type="ELTP"),
             ],
             "slots": _make_slots(20, ["Alpha", "Beta"]),
-            "batch_sizes": [10, 10],
+            "batch_sizes": [5, 5, 5, 5],
         },
         {
             "id": "all_p2_competition",
@@ -119,7 +119,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-ELTP", 2, 40, 40, "Bench", jo_type="ELTP"),
             ],
             "slots": _make_slots(40, ["Alpha", "Beta", "Gamma"]),
-            "batch_sizes": [10, 10, 10, 10],
+            "batch_sizes": [5] * 8,
         },
         {
             "id": "small_batch_edge",
@@ -141,7 +141,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-C", 2, 5, 5, "Gamma"),
             ],
             "slots": _make_slots(20, ["Alpha", "Beta", "Gamma"]),
-            "batch_sizes": [10, 10],
+            "batch_sizes": [5, 5, 5, 5],
         },
     ]
 
@@ -149,11 +149,13 @@ def scenario_definitions() -> list[dict[str, Any]]:
 def _jo(
     jid: str, priority: int, days_remaining: int, demand: int, project: str, *, jo_type: str = "LATERAL"
 ) -> dict[str, Any]:
+    total_duration = _default_total_duration(priority, jo_type)
+    days_remaining = max(1, total_duration - 3)
     return {
         "id": jid,
         "priority": priority,
         "days_remaining": days_remaining,
-        "total_duration": max(days_remaining, 1),
+        "total_duration": total_duration,
         "initial_demand": demand,
         "active_demand": demand,
         "project": project,
@@ -162,3 +164,13 @@ def _jo(
         "level": "*",
         "slots_allocated": 0,
     }
+
+
+def _default_total_duration(priority: int, jo_type: str) -> int:
+    if str(jo_type).strip().upper() == "ELTP":
+        return 140
+    if priority == 0:
+        return 15
+    if priority == 1:
+        return 45
+    return 90
