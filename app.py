@@ -8,7 +8,8 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from engine import BATCH_SIZE, DELTA_EQUAL, run_allocation
+from config import get_delta_threshold
+from engine import BATCH_SIZE, run_allocation
 from jo_utils import assert_jo_dict, safe_int
 from metrics import build_metrics_styled_table, demand_fulfilled_pct, fairness_lateral
 from models import SimulationResult, Slot
@@ -298,7 +299,7 @@ st.title("Slot Allocation Simulator")
 st.caption(
     "Per slot: try every candidate in base-score order (demand, cap, tech/level; "
     "affinity is not a gate). "
-    f"Delta equal threshold = {DELTA_EQUAL}; default batch size = {BATCH_SIZE}. "
+    f"Delta equal threshold = {get_delta_threshold():.3f}; default batch size = {BATCH_SIZE}. "
     "Final score = base + 0.10 × affinity (preference only). "
     "Check the terminal for ROW / batch / assignment prints."
 )
@@ -542,7 +543,7 @@ with tab_metrics:
         st.caption(
             "Base score uses live active_demand (25% weight), so it drops each time that JO receives a slot. "
             "When the dominant hits saturation, overflow tries the next lateral(s); if the top two competitors "
-            f"have |Δ base| ≤ {DELTA_EQUAL}, their try-order alternates each slot."
+            f"have |Δ base| ≤ {get_delta_threshold():.3f}, their try-order alternates each slot."
         )
 
         st.subheader("Distribution fairness (lateral)")
