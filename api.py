@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -16,7 +17,12 @@ from scenarios import scenario_definitions
 app = FastAPI(title="Slot Allocation Simulator API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -202,8 +208,8 @@ def simulate(req: SimulateRequest) -> dict[str, Any]:
         scenario = scenarios.get(req.scenario_id)
         if not scenario:
             raise HTTPException(status_code=404, detail="Scenario not found.")
-        jos = scenario["jos"]
-        slots = scenario["slots"]
+        jos = copy.deepcopy(scenario["jos"])
+        slots = copy.deepcopy(scenario["slots"])
         batch_sizes = req.batch_sizes or scenario.get("batch_sizes", [4])
     else:
         if not req.jos or not req.slots:

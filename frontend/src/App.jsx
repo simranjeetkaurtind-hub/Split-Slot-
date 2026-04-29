@@ -1,6 +1,20 @@
 import React, { useEffect, useMemo, useState } from "react";
 
-const API_BASE = "http://localhost:8000";
+function resolveApiBase() {
+  const env = import.meta.env.VITE_API_BASE;
+  if (typeof env === "string" && env.trim() !== "") {
+    return env.trim().replace(/\/$/, "");
+  }
+  if (typeof window !== "undefined") {
+    const h = window.location.hostname;
+    if (h === "localhost" || h === "127.0.0.1") {
+      return "/api";
+    }
+  }
+  return "http://localhost:8000";
+}
+
+const API_BASE = resolveApiBase();
 
 const defaultConfig = {
   priority_weight: 0.35,
@@ -63,8 +77,15 @@ export default function App() {
       });
 
     fetch(`${API_BASE}/scenarios`)
-      .then((res) => res.json())
-      .then((data) => {
+      .then((res) => res.json().then((data) => ({ res, data })))
+      .then(({ res, data }) => {
+        if (!res.ok || !Array.isArray(data)) {
+          setStatus({
+            type: "error",
+            message: `Scenario load failed: HTTP ${res.status} ${typeof data === "object" ? JSON.stringify(data) : String(data)}`,
+          });
+          return;
+        }
         setScenarios(data);
         if (data.length > 0) setScenarioId(data[0].id);
       })
@@ -79,12 +100,19 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!useCustomScenario && scenario?.jos) {
-      setCustomJosText(JSON.stringify(scenario.jos, null, 2));
-      setCustomSlotCount(scenario.slots?.length || 50);
-      setBatchSizes(scenario.batch_sizes || batchSizes);
+    if (useCustomScenario || !scenarioId || scenarios.length === 0) return;
+    const s = scenarios.find((x) => x.id === scenarioId);
+    if (!s?.jos) return;
+    setCustomJosText(JSON.stringify(s.jos, null, 2));
+    setCustomSlotCount(s.slots?.length || 50);
+    const raw = s.batch_sizes;
+    if (Array.isArray(raw) && raw.length > 0) {
+      const parsed = raw
+        .map((v) => Number(v))
+        .filter((n) => Number.isFinite(n) && n > 0);
+      if (parsed.length > 0) setBatchSizes(parsed);
     }
-  }, [scenario, useCustomScenario]);
+  }, [scenarioId, scenarios, useCustomScenario]);
 
   const weightSum = useMemo(
     () =>
@@ -140,19 +168,36 @@ export default function App() {
 
   const resetConfig = () => setConfig(savedConfig);
 
+  /** Stable JO order for tables: scenario roster first, then any extra ids from results (custom JOs). */
+  const joDisplayOrder = useMemo(() => {
+    const snap = result?.jo_snapshots_end;
+    const fromScenario = (scenario?.jos || []).map((j) => j.id);
+    if (!snap) return fromScenario;
+    const extra = Object.keys(snap).filter((id) => !fromScenario.includes(id));
+    return [...fromScenario, ...extra.sort()];
+  }, [result, scenario]);
+
   const batchAllocations = useMemo(() => {
     if (!result?.assignments) return [];
     const bySlot = new Map();
     result.assignments.forEach((a) => bySlot.set(a.slot_id, a.jo_id));
+    const keys =
+      joDisplayOrder.length > 0
+        ? joDisplayOrder
+        : Object.keys(result.jo_snapshots_end || {}).sort();
     return (result.batch_debug || []).map((batch) => {
-      const counts = {};
+      const counts = Object.fromEntries(keys.map((id) => [id, 0]));
+      let unassigned = 0;
       batch.slot_ids.forEach((slotId) => {
         const joId = bySlot.get(slotId) || "-";
-        counts[joId] = (counts[joId] || 0) + 1;
+        if (joId === "-") unassigned += 1;
+        else if (Object.prototype.hasOwnProperty.call(counts, joId)) counts[joId] += 1;
+        else counts[joId] = (counts[joId] || 0) + 1;
       });
+      if (unassigned > 0) counts["(unassigned)"] = unassigned;
       return { batchIndex: batch.batch_index, counts };
     });
-  }, [result]);
+  }, [result, joDisplayOrder]);
   const batches = result?.batch_debug ?? [];
   const activeBatch = batches[batchIndex];
 
@@ -393,14 +438,21 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {Object.entries(batchAllocations[batchIndex].counts)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([joId, count]) => (
+                      {joDisplayOrder.map((joId) => {
+                        const count = batchAllocations[batchIndex].counts[joId] ?? 0;
+                        return (
                           <tr key={joId}>
                             <td>{joId}</td>
                             <td>{count}</td>
                           </tr>
-                        ))}
+                        );
+                      })}
+                      {(batchAllocations[batchIndex].counts["(unassigned)"] ?? 0) > 0 && (
+                        <tr key="unassigned">
+                          <td>(unassigned)</td>
+                          <td>{batchAllocations[batchIndex].counts["(unassigned)"]}</td>
+                        </tr>
+                      )}
                     </tbody>
                   </table>
                 )}
@@ -445,59 +497,74 @@ export default function App() {
                   <th>JO</th>
                   <th>Priority</th>
                   <th>Total Demand</th>
-                  <th>Remaining Demand</th>
+                  <th>Remaining (after run)</th>
+                  {result ? <th>Slots allocated</th> : null}
                   <th>Days Remaining</th>
                   <th>Project</th>
                   <th>Type</th>
                 </tr>
               </thead>
               <tbody>
-                {scenario.jos.map((jo) => (
-                  <tr key={jo.id}>
-                    <td>{jo.id}</td>
-                    <td>{jo.priority}</td>
-                    <td>{jo.initial_demand}</td>
-                    <td>{jo.active_demand}</td>
-                    <td>{jo.days_remaining}</td>
-                    <td>{jo.project}</td>
-                    <td>{jo.type}</td>
-                  </tr>
-                ))}
+                {scenario.jos.map((jo) => {
+                  const end = result?.jo_snapshots_end?.[jo.id];
+                  return (
+                    <tr key={jo.id}>
+                      <td>{jo.id}</td>
+                      <td>{jo.priority}</td>
+                      <td>{jo.initial_demand}</td>
+                      <td>{end != null ? end.active_demand : jo.active_demand}</td>
+                      {result ? <td>{end != null ? end.slots_allocated : "—"}</td> : null}
+                      <td>{jo.days_remaining}</td>
+                      <td>{jo.project}</td>
+                      <td>{jo.type}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </>
         )}
         {result ? (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>JO</th>
-                <th>Total Slots</th>
-                <th>Saturation</th>
-                <th>% Share</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Object.values(result.jo_snapshots_end || {}).map((jo) => (
-                <tr key={jo.id}>
-                  <td>{jo.id}</td>
-                  <td>{jo.slots_allocated}</td>
-                  <td>
-                    {jo.initial_demand
-                      ? ((jo.slots_allocated / jo.initial_demand) * 100).toFixed(1)
-                      : "0.0"}
-                    %
-                  </td>
-                  <td>
-                    {result.assignments?.length
-                      ? ((jo.slots_allocated / result.assignments.length) * 100).toFixed(1)
-                      : "0.0"}
-                    %
-                  </td>
+          <>
+            <h3>Results (same order as scenario)</h3>
+            <p className="pill">
+              JOs with 0 slots were still evaluated; caps/score may have blocked assignment.
+            </p>
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>JO</th>
+                  <th>Total Slots</th>
+                  <th>Saturation</th>
+                  <th>% Share</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {joDisplayOrder.map((id) => {
+                  const jo = result.jo_snapshots_end?.[id];
+                  if (!jo) return null;
+                  return (
+                    <tr key={id}>
+                      <td>{jo.id}</td>
+                      <td>{jo.slots_allocated}</td>
+                      <td>
+                        {jo.initial_demand
+                          ? ((jo.slots_allocated / jo.initial_demand) * 100).toFixed(1)
+                          : "0.0"}
+                        %
+                      </td>
+                      <td>
+                        {result.assignments?.length
+                          ? ((jo.slots_allocated / result.assignments.length) * 100).toFixed(1)
+                          : "0.0"}
+                        %
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </>
         ) : (
           <p>No results yet.</p>
         )}

@@ -32,7 +32,6 @@ from scoring import (
     saturation_ratio,
 )
 
-DELTA_EQUAL = 0.040
 BATCH_SIZE = 4
 
 
@@ -361,11 +360,12 @@ def _print_delta_block(
         print(
             f"Delta = |{round(top_bs, 4)} - {round(second_bs, 4)}| = {round(delta_val, 4)}"
         )
-        print(f"Threshold = {_delta_threshold():.3f}")
-        if delta_val <= _delta_threshold():
-            print("|Δ| ≤ 0.040 (equal tier); slot split alternates 50–50.")
+        thr = _delta_threshold()
+        print(f"Threshold = {thr:.3f}")
+        if delta_val <= thr:
+            print(f"|Δ| ≤ {thr:.3f} (equal tier); slot split alternates 50–50.")
         else:
-            print("\u2192 |Δ| > 0.040 \u2192 dominant gets the slot.")
+            print(f"\u2192 |Δ| > {thr:.3f} \u2192 dominant gets the slot.")
     else:
         print("Delta: n/a (single lateral competitor)")
         print(f"Threshold = {_delta_threshold():.3f}")
@@ -426,9 +426,10 @@ def _build_batch_debug_log(
         lines.append(
             f"Delta = |{round(top_bs, 4)} - {round(second_bs, 4)}| = {round(delta_val, 4)}"
         )
-        lines.append(f"Threshold = {_delta_threshold():.3f}")
+        thr = _delta_threshold()
+        lines.append(f"Threshold = {thr:.3f}")
         lines.append(
-            "Slot rule: |Δ|≤0.04 → alternate 50–50 between top two; else greedy to #1."
+            f"Slot rule: |Δ|≤{thr:.3f} → alternate 50–50 between top two; else greedy to #1."
         )
     else:
         lines.append("Delta: n/a (single or no competitor)")

@@ -28,11 +28,23 @@ def priority_score_from_priority(priority: Any) -> float:
     return 1.0 / (pl + 1)
 
 
-def urgency_score(days_remaining: int, total_duration: int) -> float:
+def compute_urgency(
+    jo: dict,
+    days_remaining: int,
+    total_duration: int,
+    demand_score_value: float,
+) -> float:
     if total_duration <= 0:
-        return 1.0
-    r = max(0.0, min(1.0, days_remaining / total_duration))
-    return 1.0 - r
+        base_urgency = 1.0
+    else:
+        ratio = max(0.0, min(1.0, days_remaining / total_duration))
+        base_urgency = 1.0 - ratio
+    jo_type = str(jo.get("type", jo.get("jo_type", ""))).strip().upper()
+    if jo_type == JOType.ELTP.value:
+        beta = 0.35
+        adjusted = min(1.0, base_urgency + beta * demand_score_value)
+        return adjusted
+    return base_urgency
 
 
 def demand_score(jo: dict) -> float:
@@ -45,8 +57,13 @@ def demand_score(jo: dict) -> float:
 def base_score(jo: dict) -> float:
     assert_jo_dict(jo)
     ps = priority_score_from_priority(jo["priority"])
-    us = urgency_score(safe_int(jo.get("days_remaining"), 0), safe_int(jo.get("total_duration"), 0))
     ds = demand_score(jo)
+    us = compute_urgency(
+        jo,
+        safe_int(jo.get("days_remaining"), 0),
+        safe_int(jo.get("total_duration"), 0),
+        ds,
+    )
     return (
         get_weight("priority_weight") * ps
         + get_weight("urgency_weight") * us
@@ -62,8 +79,13 @@ def affinity_score_slot(jo: dict, slot_project: str) -> float:
 def score_breakdown(jo: dict, slot_project: str) -> dict[str, float]:
     assert_jo_dict(jo)
     ps = priority_score_from_priority(jo["priority"])
-    us = urgency_score(safe_int(jo.get("days_remaining"), 0), safe_int(jo.get("total_duration"), 0))
     ds = demand_score(jo)
+    us = compute_urgency(
+        jo,
+        safe_int(jo.get("days_remaining"), 0),
+        safe_int(jo.get("total_duration"), 0),
+        ds,
+    )
     base = (
         get_weight("priority_weight") * ps
         + get_weight("urgency_weight") * us
@@ -118,32 +140,57 @@ def saturation_ratio(jo: dict) -> float:
 def get_saturation_band(jo: dict) -> tuple[str, str, str, float]:
     """
     Returns (band_name, band_label, split_rule, dominant_share).
-    Band labels:
-    - P0/P1: BELOW LOW (<45%), LOW (≥45%), MID (≥65%), HIGH (≥80%)
-    - P2/P3/ELTP: BELOW LOW (<25%), LOW (≥25%), HIGH (≥50%)
+
+    P0: greedy <45%; then 80:20 / 60:40 / 40:60.
+    P1: greedy <35%; then 70:30 / 60:40 / 40:60.
+    P2 lateral: greedy <25%; then 30:70 / 40:60 / 20:80.
+    ELTP: greedy <30%; then 80:20 / 60:40 / 80:20.
     """
     assert_jo_dict(jo)
     ratio = saturation_ratio(jo)
     pl = priority_level(jo["priority"])
-    if pl in (0, 1):
+    jo_type = str(jo.get("type", jo.get("jo_type", ""))).strip().upper()
+
+    if pl == 0:
         if ratio < 0.45:
             return ("BELOW LOW", "<45%", "GREEDY", 1.0)
         if ratio < 0.65:
             return ("LOW", "45–65%", "80:20", 0.80)
         if ratio < 0.80:
             return ("MID", "65–80%", "60:40", 0.60)
-        return ("HIGH", "≥80%", "30:70", 0.30)
+        return ("HIGH", "≥80%", "40:60", 0.40)
+
+    if pl == 1:
+        if ratio < 0.35:
+            return ("BELOW LOW", "<35%", "GREEDY", 1.0)
+        if ratio < 0.55:
+            return ("LOW", "35–55%", "70:30", 0.70)
+        if ratio < 0.70:
+            return ("MID", "55–70%", "60:40", 0.60)
+        return ("HIGH", "≥70%", "40:60", 0.40)
+
+    if jo_type == JOType.ELTP.value:
+        if ratio < 0.30:
+            return ("BELOW LOW", "<30%", "GREEDY", 1.0)
+        if ratio < 0.55:
+            return ("LOW", "30–55%", "80:20", 0.80)
+        if ratio < 0.70:
+            return ("MID", "55–70%", "60:40", 0.60)
+        return ("TOP", "≥70%", "80:20", 0.80)
+
     if ratio < 0.25:
         return ("BELOW LOW", "<25%", "GREEDY", 1.0)
-    if ratio < 0.50:
-        return ("LOW", "25–50%", "80:20", 0.80)
-    return ("HIGH", "≥50%", "50:50", 0.50)
+    if ratio < 0.65:
+        return ("LOW", "25–65%", "30:70", 0.30)
+    if ratio < 0.80:
+        return ("MID", "65–80%", "40:60", 0.40)
+    return ("TOP", "≥80%", "20:80", 0.20)
 
 
 def get_split_ratio(jo: dict) -> tuple[float, float]:
     """
     Progressive saturation band: (dominant_share, competing_share) from priority + saturation_ratio(jo).
-    ELTP follows the P2/P3 bands. Shares sum to 1.0. Used for batch cap splits.
+    ELTP uses its own ladder; lateral P2/P3 use the lateral ladder. Shares sum to 1.0.
     """
     _, _, _, dominant_share = get_saturation_band(jo)
     return (dominant_share, 1.0 - dominant_share)

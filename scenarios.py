@@ -68,7 +68,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-C", 2, 10, 10, "Gamma"),
                 _jo("JO-ELTP", 2, 100, 100, "Bench", jo_type="ELTP"),
             ],
-            "slots": _make_slots(100, ["Alpha", "Beta", "Gamma"]),
+            "slots": _make_slots(80, ["Alpha", "Beta", "Gamma"]),
             "batch_sizes": [5] * 20,
         },
         {
@@ -119,7 +119,7 @@ def scenario_definitions() -> list[dict[str, Any]]:
                 _jo("JO-ELTP", 2, 40, 40, "Bench", jo_type="ELTP"),
             ],
             "slots": _make_slots(40, ["Alpha", "Beta", "Gamma"]),
-            "batch_sizes": [5] * 8,
+            "batch_sizes": [3]* 8,
         },
         {
             "id": "small_batch_edge",
